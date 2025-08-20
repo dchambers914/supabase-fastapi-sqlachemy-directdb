@@ -47,6 +47,8 @@ You can deploy this service on various platforms like Render, Railway, Heroku, o
 - Simple rate limiting:
   - SlowAPI limiter with `@limiter.limit(RATE_LIMIT)` applied to both endpoints.
   - Configure via `RATE_LIMIT` env var (e.g., `100/hour`). This is a basic throttle, not DDoS protection.
+- Least-privileged DB role:
+  - The app uses a restricted read-only database user by default (see section below). This limits blast radius even if unsafe SQL is attempted.
 
 ### 3. ChatGPT Integration
 
@@ -155,12 +157,12 @@ Guidelines:
 ## 🔒 Security Considerations
 
 
-### Current Security Setup:
-- Authentication:  API key only; prefer OAuth2/JWT in production
+### Current Security Setup
+- Authentication: API key only; prefer OAuth2/JWT in production
 - SQL validation: none; arbitrary SQL accepted; add a validator to restrict to single SELECT
-- Rate limiting: basic SlowAPI; not DDoS/multi-tenant grade controls
+- Rate limiting: enabled via SlowAPI (`RATE_LIMIT`)
+- Database role: least-privileged read-only user (not admin)
 - Authorization/RBAC: none in-app
-- Database role: app uses a least-privileged read-only role; avoid admin credentials
 
 ### Essential Security Measures for Production:
 
