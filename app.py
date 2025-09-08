@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import re
+from urllib.parse import unquote
+
+ALLOWED_TABLE = "public.n8n"
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +24,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+SELECT_ONLY = re.compile(r"^\s*select\b", re.I)
+FORBIDDEN = re.compile(
+    r";|--|/\*|\b(insert|update|delete|alter|drop|create|grant|revoke|truncate|copy|call|refresh|vacuum|analyze|set|reset)\b",
+    re.I,
+)
+TABLES = re.compile(r"\b(from|join)\s+((?:\w+\.)?\w+)", re.I)
 
 # Load environment variables
 load_dotenv()
@@ -86,6 +97,25 @@ def set_session_readonly(dbapi_connection, connection_record):
         logger.debug("SQLAlchemy DBAPI session set to readonly")
     except Exception as e:
         logger.warning(f"Failed to set SQLAlchemy session to readonly: {e}")
+
+def _validate_sql_for_n8n(raw: str):
+    q = unquote(raw).strip()
+    if not SELECT_ONLY.search(q):
+        raise HTTPException(status_code=400, detail="Only SELECT statements are allowed.")
+    if FORBIDDEN.search(q):
+        raise HTTPException(status_code=400, detail="Forbidden token/statement detected.")
+    # normalize allowed forms: "n8n" or "public.n8n"
+    allowed = {ALLOWED_TABLE.lower(), ALLOWED_TABLE.split(".", 1)[-1].lower()}
+    refs = [m.group(2).lower() for m in TABLES.finditer(q)]
+    if not refs:
+        raise HTTPException(status_code=400, detail="Query must reference a table.")
+    for t in refs:
+        if t not in allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Only {ALLOWED_TABLE} is allowed (found reference to '{t}').",
+            )
+    return q
 
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
