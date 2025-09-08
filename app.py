@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text, event
@@ -137,6 +137,16 @@ async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any
     except Exception as e:
         logger.error(f"Unexpected error in SQLAlchemy endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+@app.get("/", include_in_schema=False)
+@limiter.exempt
+async def root():
+    return {"status": "ok", "name": "Strouse KB API", "version": "1.0.0"}
+
+@app.head("/", include_in_schema=False)
+@limiter.exempt
+async def root_head():
+    return Response(status_code=200)
 
 @app.get("/sqlquery_direct/")
 @limiter.limit(RATE_LIMIT)
