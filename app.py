@@ -72,6 +72,9 @@ app.add_middleware(
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
 logger.info(f"Using rate limit: {RATE_LIMIT}")
 
+if provided_key != expected_key:
+    raise HTTPException(status_code=401, detail="Invalid API key")
+
 # Initialize SlowAPI limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
