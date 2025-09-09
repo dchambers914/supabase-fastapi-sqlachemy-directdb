@@ -1,99 +1,129 @@
-from fastapi import FastAPI, HTTPException, Request, status, Response, Header, Query
-from fastapi.responses import JSONResponse
+import os
+import logging
+import re
+from typing import Any, List, Dict
+from urllib.parse import urlparse, unquote
+
+from fastapi import FastAPI, HTTPException, Header, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from pydantic import BaseModel
+
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.exc import SQLAlchemyError
-import logging
-import os
-from typing import Any, Union, List, Dict
-from starlette.middleware.base import BaseHTTPMiddleware
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
+
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-import re
-from urllib.parse import unquote
-from pydantic import BaseModel
+from slowapi.middleware import SlowAPIMiddleware
 
-ALLOWED_TABLE = "public.n8n"
-
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# ------------------ Config & Logging ------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("app")
 
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
 logger.info(f"Using rate limit: {RATE_LIMIT}")
 
-SELECT_ONLY = re.compile(r"^\s*select\b", re.I)
-FORBIDDEN = re.compile(
-    r";|--|/\*|\b(insert|update|delete|alter|drop|create|grant|revoke|truncate|copy|call|refresh|vacuum|analyze|set|reset)\b",
-    re.I,
-)
-TABLES = re.compile(r"\b(from|join)\s+((?:\w+\.)?\w+)", re.I)
-
-# Load environment variables
-load_dotenv()
-
-# Database URL and credentials
-DATABASE_URL = os.getenv("DATABASE_URL")
 REX_API_KEY = os.getenv("REX_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    logger.warning("DATABASE_URL environment variable is not set")
-
+    logger.warning("DATABASE_URL is not set; queries will fail until configured.")
 if not REX_API_KEY:
-    logger.error("REX_API_KEY environment variable is not set")
-    raise ValueError("REX_API_KEY environment variable is required")
+    logger.error("REX_API_KEY is not set; requests will be rejected.")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+# Only allow queries that hit this table (set to None to disable)
+ALLOWED_TABLE = "public.n8n"            # or "public.documentation"
+ENFORCE_TABLE_RESTRICTION = False       # flip to True to enforce
 
-# Parse connection details from DATABASE_URL
-from urllib.parse import urlparse
-parsed_url = urlparse(DATABASE_URL)
-DB_HOST = parsed_url.hostname
-DB_PORT = parsed_url.port
-DB_NAME = parsed_url.path[1:]  # Remove leading slash
-DB_USER = parsed_url.username
-DB_PASSWORD = parsed_url.password
+# Safety regexes (used only if ENFORCE_TABLE_RESTRICTION=True)
+SELECT_ONLY = re.compile(r"^\s*select\b", re.I)
+FORBIDDEN = re.compile(
+    r"--|/\*|\b(insert|update|delete|alter|drop|create|grant|revoke|truncate|copy|call|refresh|vacuum|analyze|set|reset)\b",
+    re.I,
+)  # NOTE: semicolon removed so 'SELECT ...;' is allowed
+TABLES = re.compile(r"\b(from|join)\s+((?:\w+\.)?\w+)", re.I)
 
-# Initialize FastAPI
-app = FastAPI()
+# ------------------ App & Middleware ------------------
+app = FastAPI(title="Cricket Database PostgreSQL API", version="1.0.0")
 
-class QueryBody(BaseModel):
-    sqlquery: str
-
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your frontend origins in production
+    allow_origins=["*"],  # lock down in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# ------------------ DB Engine ------------------
+engine = None
+if DATABASE_URL:
+    # Ensure SSL even if the URL is missing ?sslmode=require
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
+
+    @event.listens_for(engine, "connect")
+    def set_session_readonly(dbapi_connection, connection_record):
+        try:
+            dbapi_connection.set_session(readonly=True, autocommit=False)
+            logger.debug("Set DBAPI session to read-only")
+        except Exception as e:
+            logger.warning(f"Could not set DB session to read-only: {e}")
+
+# Parse DSN only if available (for the /sqlquery_direct/ endpoint)
+DB_HOST = DB_PORT = DB_NAME = DB_USER = DB_PASSWORD = None
+if DATABASE_URL:
+    parsed = urlparse(DATABASE_URL)
+    DB_HOST = parsed.hostname
+    DB_PORT = parsed.port
+    DB_NAME = (parsed.path or "/")[1:]
+    DB_USER = parsed.username
+    DB_PASSWORD = parsed.password  # urlparse returns decoded password
+
+# ------------------ Models ------------------
+class QueryBody(BaseModel):
+    sqlquery: str
+
+# ------------------ Helpers ------------------
 def _require_key(provided: str) -> None:
-    """Validate API key."""
     if not REX_API_KEY:
-        # Misconfiguration: no key set on server
         raise HTTPException(status_code=500, detail="Server misconfigured: REX_API_KEY not set")
     if provided != REX_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+def _validate_sql_for_n8n(raw: str) -> str:
+    """Optional: enforce SELECT only + restrict table to ALLOWED_TABLE."""
+    q = unquote(raw).strip()
+    if not SELECT_ONLY.search(q):
+        raise HTTPException(status_code=400, detail="Only SELECT statements are allowed.")
+    if FORBIDDEN.search(q):
+        raise HTTPException(status_code=400, detail="Forbidden token/statement detected.")
+    if ENFORCE_TABLE_RESTRICTION and ALLOWED_TABLE:
+        allowed = {ALLOWED_TABLE.lower(), ALLOWED_TABLE.split(".", 1)[-1].lower()}
+        refs = [m.group(2).lower() for m in TABLES.finditer(q)]
+        if not refs:
+            raise HTTPException(status_code=400, detail="Query must reference a table.")
+        for t in refs:
+            if t not in allowed:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Only {ALLOWED_TABLE} is allowed (found reference to '{t}').",
+                )
+    return q
+
 def _run_query(sqlquery: str) -> Any:
-    """Execute the SQL and return rows (SELECT) or a status message."""
-    if not DATABASE_URL or engine is None:
+    if engine is None:
         raise HTTPException(status_code=500, detail="Server misconfigured: DATABASE_URL not set")
 
-    sql = sqlquery.strip()
-    # Optional safety: only allow SELECT during initial bring‑up
-    if not sql.lower().startswith("select"):
-        # If you want to enable writes, remove this block and implement your own safeguards
-        return {"status": "success", "message": "Non-SELECT execution disabled on this server"}
+    # Enforce read-only semantics and optional table restriction
+    sql = _validate_sql_for_n8n(sqlquery)
 
     try:
         with engine.connect() as conn:
@@ -102,25 +132,31 @@ def _run_query(sqlquery: str) -> Any:
         return rows
     except SQLAlchemyError as e:
         logger.exception("Database error while running query")
-        # Return a clear error back to the client (matches what you saw earlier)
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
+# ------------------ Routes ------------------
 @app.get("/health")
+@limiter.exempt
 def health():
     return {"status": "ok"}
 
-# Support GET with and without trailing slash
+# GET (supports both with/without trailing slash)
 @app.get("/sqlquery_alchemy")
 @app.get("/sqlquery_alchemy/")
+@limiter.limit(RATE_LIMIT)
 def execute_sqlalchemy_query_get(
+    request: Request,
     sqlquery: str = Query(..., alias="sqlquery"),
     api_key: str = Query(..., alias="api_key")
 ):
     _require_key(api_key)
     return _run_query(sqlquery)
 
+# POST + header
 @app.post("/sqlquery_alchemy")
+@limiter.limit(RATE_LIMIT)
 def execute_sqlalchemy_query_post(
+    request: Request,
     body: QueryBody,
     x_api_key: str = Header(None)
 ):
@@ -129,170 +165,48 @@ def execute_sqlalchemy_query_post(
     _require_key(x_api_key)
     return _run_query(body.sqlquery)
 
-# Rate limiting configuration (default 100/hour)
-RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
-logger.info(f"Using rate limit: {RATE_LIMIT}")
-
-if provided_key != expected_key:
-    raise HTTPException(status_code=401, detail="Invalid API key")
-
-# Initialize SlowAPI limiter
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-
-# Custom 429 handler (match prior app behavior)
-async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return JSONResponse(
-        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"detail": "Rate limit exceeded. Please try again later or contact your administrator."}
-    )
-
-app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
-
-# Create SQLAlchemy engine
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-# Ensure all SQLAlchemy connections are session-level read-only
-@event.listens_for(engine, "connect")
-def set_session_readonly(dbapi_connection, connection_record):
-    try:
-        # dbapi_connection is the raw psycopg2 connection
-        dbapi_connection.set_session(readonly=True, autocommit=False)
-        logger.debug("SQLAlchemy DBAPI session set to readonly")
-    except Exception as e:
-        logger.warning(f"Failed to set SQLAlchemy session to readonly: {e}")
-
-def _validate_sql_for_n8n(raw: str):
-    q = unquote(raw).strip()
-    if not SELECT_ONLY.search(q):
-        raise HTTPException(status_code=400, detail="Only SELECT statements are allowed.")
-    if FORBIDDEN.search(q):
-        raise HTTPException(status_code=400, detail="Forbidden token/statement detected.")
-    # normalize allowed forms: "n8n" or "public.n8n"
-    allowed = {ALLOWED_TABLE.lower(), ALLOWED_TABLE.split(".", 1)[-1].lower()}
-    refs = [m.group(2).lower() for m in TABLES.finditer(q)]
-    if not refs:
-        raise HTTPException(status_code=400, detail="Query must reference a table.")
-    for t in refs:
-        if t not in allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Only {ALLOWED_TABLE} is allowed (found reference to '{t}').",
-            )
-    return q
-
-@app.get("/sqlquery_alchemy/")
+# Optional: direct psycopg2 path (read-only)
+@app.get("/sqlquery_direct/")
 @limiter.limit(RATE_LIMIT)
-async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any:
-    """Execute SQL query using SQLAlchemy and return results directly."""
-    if api_key != REX_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    logger.debug(f"Received API call to SQLAlchemy endpoint: {request.url}")
-    logger.debug(f"SQL Query: {sqlquery}")
+def sqlquery_direct(request: Request, sqlquery: str, api_key: str) -> Any:
+    _require_key(api_key)
+    if not (DB_HOST and DB_PORT and DB_NAME and DB_USER and DB_PASSWORD):
+        raise HTTPException(status_code=500, detail="Server misconfigured: DATABASE_URL not set")
 
     try:
-        with engine.connect() as connection:
-            # Start a read-only transaction to enforce read-only at the DB level
-            trans = connection.begin()
-            try:
-                connection.exec_driver_sql("SET TRANSACTION READ ONLY")
-
-                # Execute query
-                result = connection.execute(text(sqlquery))
-                
-                # If SELECT query, return results
-                if sqlquery.strip().lower().startswith('select'):
-                    # Get column names
-                    columns = result.keys()
-                    
-                    # Fetch all rows
-                    rows = result.fetchall()
-                    
-                    # Convert rows to list of dictionaries
-                    results = [dict(zip(columns, row)) for row in rows]
-                    
-                    logger.debug(f"Query executed successfully via SQLAlchemy, returned {len(results)} rows")
-                    trans.commit()
-                    return results
-                
-                # For non-SELECT queries, attempt will fail due to read-only transaction
-                else:
-                    trans.commit()
-                    logger.debug("Non-SELECT query attempted in read-only transaction")
-                    return {"status": "success", "message": "Query executed successfully"}
-            except:
-                trans.rollback()
-                raise
-
-    except SQLAlchemyError as e:
-        logger.error(f"SQLAlchemy error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error in SQLAlchemy endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        conn = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+            user=DB_USER, password=DB_PASSWORD,
+            cursor_factory=RealDictCursor,
+            sslmode="require"  # Supabase requires TLS
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_validate_sql_for_n8n(sqlquery))
+                return list(cur.fetchall())
+        finally:
+            conn.close()
+    except psycopg2.Error as e:
+        logger.error(f"PostgreSQL error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 @app.get("/", include_in_schema=False)
 @limiter.exempt
-async def root():
+def root():
     return {"status": "ok", "name": "Strouse KB API", "version": "1.0.0"}
 
 @app.head("/", include_in_schema=False)
 @limiter.exempt
-async def root_head():
+def root_head():
     return Response(status_code=200)
 
-@app.get("/sqlquery_direct/")
-@limiter.limit(RATE_LIMIT)
-async def sqlquery_direct(sqlquery: str, api_key: str, request: Request) -> Any:
-    """Execute SQL query using direct psycopg2 connection and return results."""
-    if api_key != REX_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    logger.debug(f"Received API call to direct connection endpoint: {request.url}")
-    logger.debug(f"SQL Query: {sqlquery}")
-
-    connection = None
-    try:
-        # Create direct connection
-        connection = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            cursor_factory=RealDictCursor  # This will return results as dictionaries
-        )
-        # Enforce read-only at the session level for this connection
-        connection.set_session(readonly=True, autocommit=False)
-        
-        with connection.cursor() as cursor:
-            # Execute query
-            cursor.execute(sqlquery)
-            
-            # If SELECT query, return results
-            if sqlquery.strip().lower().startswith('select'):
-                results = cursor.fetchall()
-                logger.debug(f"Query executed successfully via direct connection, returned {len(results)} rows")
-                # RealDictCursor returns results as dictionaries, so we can return directly
-                return list(results)
-            
-            # For non-SELECT queries, commit and return status
-            else:
-                connection.commit()
-                logger.debug("Non-SELECT query executed successfully via direct connection")
-                return {"status": "success", "message": "Query executed successfully"}
-
-    except psycopg2.Error as e:
-        logger.error(f"PostgreSQL error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error in direct connection endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-    finally:
-        if connection:
-            connection.close()
-            logger.debug("Database connection closed")
+# Rate limit handler
+@app.exception_handler(RateLimitExceeded)
+def ratelimit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": "Rate limit exceeded. Please try again later or contact your administrator."}
+    )
 
 if __name__ == "__main__":
     import uvicorn
