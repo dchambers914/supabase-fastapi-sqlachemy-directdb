@@ -1,11 +1,11 @@
-from fastapi import FastAPI, HTTPException, Request, status, Response
+from fastapi import FastAPI, HTTPException, Request, status, Response, Header, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.exc import SQLAlchemyError
 import logging
 import os
-from typing import Any, Union
+from typing import Any, Union, List, Dict
 from starlette.middleware.base import BaseHTTPMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -15,6 +15,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import re
 from urllib.parse import unquote
+from pydantic import BaseModel
 
 ALLOWED_TABLE = "public.n8n"
 
@@ -23,7 +24,10 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
+
+RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
+logger.info(f"Using rate limit: {RATE_LIMIT}")
 
 SELECT_ONLY = re.compile(r"^\s*select\b", re.I)
 FORBIDDEN = re.compile(
@@ -40,12 +44,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 REX_API_KEY = os.getenv("REX_API_KEY")
 
 if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is not set")
-    raise ValueError("DATABASE_URL environment variable is required")
+    logger.warning("DATABASE_URL environment variable is not set")
 
 if not REX_API_KEY:
     logger.error("REX_API_KEY environment variable is not set")
     raise ValueError("REX_API_KEY environment variable is required")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
 
 # Parse connection details from DATABASE_URL
 from urllib.parse import urlparse
@@ -59,6 +64,9 @@ DB_PASSWORD = parsed_url.password
 # Initialize FastAPI
 app = FastAPI()
 
+class QueryBody(BaseModel):
+    sqlquery: str
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +75,59 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _require_key(provided: str) -> None:
+    """Validate API key."""
+    if not REX_API_KEY:
+        # Misconfiguration: no key set on server
+        raise HTTPException(status_code=500, detail="Server misconfigured: REX_API_KEY not set")
+    if provided != REX_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+def _run_query(sqlquery: str) -> Any:
+    """Execute the SQL and return rows (SELECT) or a status message."""
+    if not DATABASE_URL or engine is None:
+        raise HTTPException(status_code=500, detail="Server misconfigured: DATABASE_URL not set")
+
+    sql = sqlquery.strip()
+    # Optional safety: only allow SELECT during initial bring‑up
+    if not sql.lower().startswith("select"):
+        # If you want to enable writes, remove this block and implement your own safeguards
+        return {"status": "success", "message": "Non-SELECT execution disabled on this server"}
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(sql))
+            rows = [dict(row._mapping) for row in result]
+        return rows
+    except SQLAlchemyError as e:
+        logger.exception("Database error while running query")
+        # Return a clear error back to the client (matches what you saw earlier)
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# Support GET with and without trailing slash
+@app.get("/sqlquery_alchemy")
+@app.get("/sqlquery_alchemy/")
+def execute_sqlalchemy_query_get(
+    sqlquery: str = Query(..., alias="sqlquery"),
+    api_key: str = Query(..., alias="api_key")
+):
+    _require_key(api_key)
+    return _run_query(sqlquery)
+
+@app.post("/sqlquery_alchemy")
+def execute_sqlalchemy_query_post(
+    body: QueryBody,
+    x_api_key: str = Header(None)
+):
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="Missing x-api-key header")
+    _require_key(x_api_key)
+    return _run_query(body.sqlquery)
 
 # Rate limiting configuration (default 100/hour)
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
